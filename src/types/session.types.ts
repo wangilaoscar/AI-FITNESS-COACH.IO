@@ -90,3 +90,21 @@ export interface TrackingSession {
   readonly statistics: SessionStatistics;
   readonly lifecycle: LifecycleTimestamps;
 }
+/**
+ * SessionRecord — the permanent, immutable record of a completed and
+ * saved session (Milestone 3.5). A frozen snapshot of a TrackingSession:
+ * its final RoutePoint sequence and final SessionStatistics, together with
+ * the lifecycle timestamps and the GPSConfiguration the session used.
+ * Every field is an existing domain type above — nothing new was invented,
+ * and no business field (id, title, device identifier, schema version) was
+ * added. `status` is deliberately excluded: a saved record has no ongoing
+ * status the way a live TrackingSession does.
+ *
+ * This is the ONLY definition of SessionRecord in the codebase.
+ */
+export interface SessionRecord {
+  readonly route: ReadonlyArray<RoutePoint>;
+  readonly statistics: SessionStatistics;
+  readonly lifecycle: LifecycleTimestamps;
+  readonly gpsConfiguration: GPSConfiguration;
+}

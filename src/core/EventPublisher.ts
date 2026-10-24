@@ -42,10 +42,7 @@
 // all, matching its locked description as "confirmation only — no data."
 
 import type { GPSHealth } from '../features/gps/types/gps.types';
-import type { RoutePoint, SessionStatistics, TrackingSession } from '../types/session.types';
-
-/** Opaque payload for the SessionRecordProduced domain event. */
-export type SessionRecord = Readonly<Record<string, unknown>>;
+import type { RoutePoint, SessionRecord, SessionStatistics, TrackingSession } from '../types/session.types';
 
 export interface SessionStartedEvent {
   readonly type: 'SessionStarted';

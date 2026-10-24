@@ -1,12 +1,13 @@
-import { TrackingEngine } from './TrackingEngine';
+﻿import { TrackingEngine } from './TrackingEngine';
 import { SessionAggregate } from './SessionAggregate';
 import { SessionCommandHandler } from './SessionCommandHandler';
 import { LocationAdmissionGate } from './LocationAdmissionGate';
 import { EventPublisher, DomainEvent } from './EventPublisher';
 import { calculateSessionStatistics } from './StatisticsCalculator';
 import type { UserPreferences } from '../types/session.types';
-import type { LocationUpdate } from '../features/gps/types/gps.types';
-
+import type { GPSHealth, LocationUpdate } from '../features/gps/types/gps.types';
+import * as assemblerModule from './SessionRecordAssembler';
+import * as relayModule from './GPSHealthRelay';
 const PREFS: UserPreferences = { accuracyTier: 'balanced' };
 
 function locationUpdate(overrides: Partial<LocationUpdate> = {}): LocationUpdate {
@@ -129,14 +130,12 @@ describe('TrackingEngine (Step 11A shell) — no module is bypassed', () => {
 });
 
 describe('TrackingEngine (Step 11A shell) — no duplicated business logic', () => {
-  it('has processCommand (11B) and processLocationUpdate (11C) but not processGPSHealth (still deferred to a later sub-stage)', () => {
-    const aggregate = new SessionAggregate();
-    const eventPublisher = new EventPublisher();
-    const engine = new TrackingEngine({ aggregate, eventPublisher }) as unknown as Record<string, unknown>;
+  it('exposes command, location, and GPS health processing entry points', () => {
+    const { engine } = setup();
 
     expect(typeof engine.processCommand).toBe('function');
     expect(typeof engine.processLocationUpdate).toBe('function');
-    expect(engine.processGPSHealth).toBeUndefined();
+    expect(typeof engine.processGPSHealth).toBe('function');
   });
 
   it('this module contains no transition-table, calculation, or admission logic of its own (structural — proven by delegating entirely to real module instances with no override)', () => {
@@ -242,30 +241,32 @@ describe('TrackingEngine (Step 11B) — command flow', () => {
     expect(result.verdict.reason).not.toBeNull();
   });
 
-  it("9. TrackingEngine contains no transition or calculation logic of its own (Stop's statistics are whatever the Aggregate already had committed — untouched by this sub-stage)", () => {
-    const { aggregate, engine } = setup();
+    it("9. TrackingEngine contains no calculation logic of its own (superseded in 11D: Stop's statistics are finalized by StatisticsCalculator — they equal an independent Calculator call on the committed data)", () => {
+    const { engine } = setup();
     engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
-    const beforeStop = aggregate.getCurrentSession()!.statistics;
 
     const result = engine.processCommand({ command: 'StopSession', timestamp: 9000 });
 
-    expect(result.session?.statistics).toEqual(beforeStop);
+    expect(result.session?.statistics).toEqual(
+      calculateSessionStatistics({ routePoints: result.session!.route, lifecycle: result.session!.lifecycle })
+    );
   });
-
-  it('SaveSession and DiscardSession are explicitly out of scope for 11B', () => {
+  // ...existing code...
+    it("9. TrackingEngine contains no calculation logic of its own (superseded in 11D: Stop's statistics are finalized by StatisticsCalculator — they equal an independent Calculator call on the committed data)", () => {
     const { engine } = setup();
     engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
-    engine.processCommand({ command: 'StopSession', timestamp: 2000 });
 
-    expect(() =>
-      engine.processCommand({
-        command: 'SaveSession',
-        timestamp: 3000,
-      } as unknown as Parameters<typeof engine.processCommand>[0])
-    ).toThrow(/not implemented until Step 11D/);
+    const result = engine.processCommand({ command: 'StopSession', timestamp: 9000 });
+
+    expect(result.session?.statistics).toEqual(
+      calculateSessionStatistics({ routePoints: result.session!.route, lifecycle: result.session!.lifecycle })
+    );
   });
 });
 
+describe('TrackingEngine (Step 11C) — location flow', () => {
+  // ...existing code...
+});
 describe('TrackingEngine (Step 11C) — location flow', () => {
   it('an admitted LocationUpdate follows the full pipeline: Gate → Factory → Aggregate → Calculator → Aggregate → Publisher', () => {
     const { aggregate, engine, log } = setup();
@@ -363,5 +364,310 @@ describe('TrackingEngine (Step 11C) — location flow', () => {
 
     expect(aggregate.getCurrentSession()?.route.length).toBe(1);
     expect(log).toEqual([]);
+  });
+});
+// ---------------------------------------------------------------------------
+// Step 11D — terminal flows (Stop finalization, Save, Discard) + GPS health
+// ---------------------------------------------------------------------------
+
+function eventOf<T extends DomainEvent['type']>(log: DomainEvent[], type: T): Extract<DomainEvent, { type: T }> {
+  const found = log.find((event) => event.type === type);
+  if (found === undefined) throw new Error(`No ${type} event was published.`);
+  return found as Extract<DomainEvent, { type: T }>;
+}
+
+/** Start at t=1000, record two admitted points (t=2000, t=3000). */
+function startAndMove(engine: TrackingEngine): void {
+  engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+  engine.processLocationUpdate(locationUpdate({ latitude: 0, longitude: 0, timestamp: 2000 }));
+  engine.processLocationUpdate(locationUpdate({ latitude: 0.001, longitude: 0, timestamp: 3000 }));
+}
+
+describe('TrackingEngine (Step 11D) — A) stop finalization', () => {
+  it('recomputes final statistics from the committed STOPPED session before SessionStopped is published', () => {
+    const { aggregate, eventPublisher, engine, log } = setup();
+    startAndMove(engine);
+    const liveStatistics = aggregate.getCurrentSession()!.statistics;
+    log.length = 0;
+
+    let committedAtPublish: ReturnType<SessionAggregate['getCurrentSession']> = null;
+    eventPublisher.subscribe((event) => {
+      if (event.type === 'SessionStopped') committedAtPublish = aggregate.getCurrentSession();
+    });
+
+    const result = engine.processCommand({ command: 'StopSession', timestamp: 10000 });
+    const stopped = eventOf(log, 'SessionStopped');
+
+    const expected = calculateSessionStatistics({
+      routePoints: stopped.session.route,
+      lifecycle: stopped.session.lifecycle,
+    });
+    expect(stopped.session.status).toBe('STOPPED');
+    expect(stopped.session.statistics).toEqual(expected);
+    // Live statistics ended at the last point (t=3000); final ones run to stoppedAt (t=10000).
+    expect(liveStatistics.elapsedActiveMs).toBe(2000);
+    expect(stopped.session.statistics.elapsedActiveMs).toBe(9000);
+    // Committed to the Aggregate BEFORE the event was delivered, and the event carries that exact snapshot.
+    expect(committedAtPublish).toBe(stopped.session);
+    expect(aggregate.getCurrentSession()).toBe(stopped.session);
+    expect(result.session).toBe(stopped.session);
+  });
+
+  it('publishes SessionStopped only — no extra StatisticsUpdated or RoutePointRecorded', () => {
+    const { engine, log } = setup();
+    startAndMove(engine);
+    log.length = 0;
+
+    engine.processCommand({ command: 'StopSession', timestamp: 10000 });
+
+    expect(log.map((event) => event.type)).toEqual(['SessionStopped']);
+  });
+
+  it('a Stop with no RoutePoints is still finalized through the Calculator (elapsed runs to stoppedAt)', () => {
+    const { engine, log } = setup();
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+    log.length = 0;
+
+    engine.processCommand({ command: 'StopSession', timestamp: 9000 });
+    const stopped = eventOf(log, 'SessionStopped');
+
+    expect(stopped.session.statistics.elapsedActiveMs).toBe(8000);
+    expect(stopped.session.statistics.distanceMeters).toBe(0);
+  });
+
+  it('a rejected StopSession publishes nothing and leaves the Aggregate untouched', () => {
+    const { aggregate, engine, log } = setup();
+
+    const result = engine.processCommand({ command: 'StopSession', timestamp: 5000 });
+
+    expect(result.accepted).toBe(false);
+    expect(result.session).toBeNull();
+    expect(log).toEqual([]);
+    expect(aggregate.getCurrentStatus()).toBe('IDLE');
+    expect(aggregate.getCurrentSession()).toBeNull();
+  });
+});
+
+describe('TrackingEngine (Step 11D) — B) save', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  function stopped() {
+    const ctx = setup();
+    startAndMove(ctx.engine);
+    ctx.engine.processCommand({ command: 'StopSession', timestamp: 10000 });
+    ctx.log.length = 0;
+    return ctx;
+  }
+
+  it('assembles the SessionRecord from the SAVED snapshot (never STOPPED) and publishes SessionRecordProduced', () => {
+    const { engine, log } = stopped();
+    const spy = jest.spyOn(assemblerModule, 'assembleSessionRecord');
+
+    const result = engine.processCommand({ command: 'SaveSession', timestamp: 11000 });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0].status).toBe('SAVED');
+    expect(spy.mock.calls[0][0]).toBe(result.session);
+    expect(log.map((event) => event.type)).toEqual(['SessionRecordProduced']);
+
+    const record = eventOf(log, 'SessionRecordProduced').sessionRecord;
+    expect(record.route).toBe(result.session!.route);
+    expect(record.statistics).toBe(result.session!.statistics);
+    expect(record.lifecycle).toBe(result.session!.lifecycle);
+    expect(record.gpsConfiguration).toBe(result.session!.gpsConfiguration);
+    expect(record.statistics.elapsedActiveMs).toBe(9000); // the final statistics committed at Stop
+    expect(Object.isFrozen(record)).toBe(true);
+  });
+
+  it('leaves the engine and Aggregate in IDLE (the Aggregate\'s existing atomic reset)', () => {
+    const { aggregate, engine, log } = stopped();
+
+    const result = engine.processCommand({ command: 'SaveSession', timestamp: 11000 });
+
+    expect(result.accepted).toBe(true);
+    expect(result.session?.status).toBe('SAVED');
+    expect(aggregate.getCurrentStatus()).toBe('IDLE');
+    expect(aggregate.getCurrentSession()).toBeNull();
+
+    log.length = 0;
+    engine.processLocationUpdate(locationUpdate({ timestamp: 20000 }));
+    expect(log).toEqual([]); // no live session to record into
+
+    const restart = engine.processCommand({ command: 'StartSession', timestamp: 30000, userPreferences: PREFS });
+    expect(restart.accepted).toBe(true);
+    expect(aggregate.getCurrentStatus()).toBe('ACTIVE');
+  });
+
+  it('a SaveSession that is not legal (session still ACTIVE) assembles nothing and publishes nothing', () => {
+    const { aggregate, engine, log } = setup();
+    startAndMove(engine);
+    log.length = 0;
+    const spy = jest.spyOn(assemblerModule, 'assembleSessionRecord');
+
+    const result = engine.processCommand({ command: 'SaveSession', timestamp: 4000 });
+
+    expect(result.accepted).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
+    expect(log).toEqual([]);
+    expect(aggregate.getCurrentStatus()).toBe('ACTIVE');
+  });
+});
+
+describe('TrackingEngine (Step 11D) — C) discard', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  function stopped() {
+    const ctx = setup();
+    startAndMove(ctx.engine);
+    ctx.engine.processCommand({ command: 'StopSession', timestamp: 10000 });
+    ctx.log.length = 0;
+    return ctx;
+  }
+
+  it('publishes SessionDiscarded (confirmation only) and assembles no SessionRecord', () => {
+    const { engine, log } = stopped();
+    const spy = jest.spyOn(assemblerModule, 'assembleSessionRecord');
+
+    engine.processCommand({ command: 'DiscardSession', timestamp: 11000 });
+
+    expect(log).toEqual([{ type: 'SessionDiscarded' }]);
+    expect(log.some((event) => event.type === 'SessionRecordProduced')).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('returns the DISCARDED snapshot and leaves the engine/Aggregate in IDLE (existing atomic reset)', () => {
+    const { aggregate, engine } = stopped();
+
+    const result = engine.processCommand({ command: 'DiscardSession', timestamp: 11000 });
+
+    expect(result.accepted).toBe(true);
+    expect(result.session?.status).toBe('DISCARDED');
+    expect(aggregate.getCurrentStatus()).toBe('IDLE');
+    expect(aggregate.getCurrentSession()).toBeNull();
+  });
+
+  it('a DiscardSession that is not legal (session still ACTIVE) publishes nothing', () => {
+    const { aggregate, engine, log } = setup();
+    startAndMove(engine);
+    log.length = 0;
+
+    const result = engine.processCommand({ command: 'DiscardSession', timestamp: 4000 });
+
+    expect(result.accepted).toBe(false);
+    expect(log).toEqual([]);
+    expect(aggregate.getCurrentStatus()).toBe('ACTIVE');
+  });
+});
+
+describe('TrackingEngine (Step 11D) — D) GPS health', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  // Deliberately meaningless fields: GPSHealth is opaque, and these tests must not invent a shape for it.
+  const health: GPSHealth = Object.freeze({ opaqueField: 'opaque-value', nested: Object.freeze({ n: 1 }) });
+
+  it('passes GPSHealth through GPSHealthRelay unchanged and publishes GPSHealthChanged', () => {
+    const { engine, log } = setup();
+    const spy = jest.spyOn(relayModule, 'relayGPSHealth');
+
+    engine.processGPSHealth(health);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(health);
+    expect(log).toHaveLength(1);
+    expect(eventOf(log, 'GPSHealthChanged').gpsHealth).toBe(health); // same reference — not copied or altered
+  });
+
+  it('never reads or mutates the TrackingSession', () => {
+    const { aggregate, engine } = setup();
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+    const before = aggregate.getCurrentSession();
+
+    engine.processGPSHealth(health);
+
+    expect(aggregate.getCurrentSession()).toBe(before);
+    expect(aggregate.getCurrentStatus()).toBe('ACTIVE');
+  });
+
+  it('adds no interpretation: not gated by session status and not de-duplicated', () => {
+    const { aggregate, engine, log } = setup();
+
+    engine.processGPSHealth(health);
+    engine.processGPSHealth(health);
+
+    expect(aggregate.getCurrentStatus()).toBe('IDLE');
+    expect(log.map((event) => event.type)).toEqual(['GPSHealthChanged', 'GPSHealthChanged']);
+    expect(eventOf(log, 'GPSHealthChanged').gpsHealth).toBe(health);
+  });
+});
+describe('TrackingEngine (Step 11D) — admission gate reset at StartSession (regression)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('a new session whose timestamps are EARLIER than the previous session\'s last accepted timestamp is still admitted', () => {
+    const { aggregate, engine, log } = setup();
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+    engine.processLocationUpdate(locationUpdate({ latitude: 0, longitude: 0, timestamp: 50000 }));
+    engine.processCommand({ command: 'StopSession', timestamp: 60000 });
+    engine.processCommand({ command: 'DiscardSession', timestamp: 61000 });
+    expect(aggregate.getCurrentStatus()).toBe('IDLE');
+
+    engine.processCommand({ command: 'StartSession', timestamp: 100, userPreferences: PREFS });
+    log.length = 0;
+    engine.processLocationUpdate(locationUpdate({ latitude: 0, longitude: 0, timestamp: 200 })); // 200 < 50000
+
+    expect(aggregate.getCurrentSession()?.route.length).toBe(1);
+    expect(log.map((event) => event.type)).toEqual(['RoutePointRecorded', 'StatisticsUpdated']);
+  });
+
+  it('also holds after Save (not just Discard)', () => {
+    const { aggregate, engine } = setup();
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+    engine.processLocationUpdate(locationUpdate({ timestamp: 50000 }));
+    engine.processCommand({ command: 'StopSession', timestamp: 60000 });
+    engine.processCommand({ command: 'SaveSession', timestamp: 61000 });
+
+    engine.processCommand({ command: 'StartSession', timestamp: 100, userPreferences: PREFS });
+    engine.processLocationUpdate(locationUpdate({ timestamp: 200 }));
+
+    expect(aggregate.getCurrentSession()?.route.length).toBe(1);
+  });
+
+  it('resets the Gate BEFORE SessionStarted is published', () => {
+    const aggregate = new SessionAggregate();
+    const eventPublisher = new EventPublisher();
+    const admissionGate = new LocationAdmissionGate();
+    const resetSpy = jest.spyOn(admissionGate, 'reset');
+    const engine = new TrackingEngine({ aggregate, eventPublisher, admissionGate });
+    const listener = jest.fn();
+    eventPublisher.subscribe(listener);
+
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+
+    expect(resetSpy).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: 'SessionStarted' }));
+    expect(resetSpy.mock.invocationCallOrder[0]).toBeLessThan(listener.mock.invocationCallOrder[0]);
+  });
+
+  it('a REJECTED StartSession does not reset the Gate (a live session\'s sequencing is preserved)', () => {
+    const { aggregate, engine } = setup();
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+    engine.processLocationUpdate(locationUpdate({ timestamp: 5000 }));
+
+    const second = engine.processCommand({ command: 'StartSession', timestamp: 6000, userPreferences: PREFS });
+    expect(second.accepted).toBe(false); // already ACTIVE
+
+    engine.processLocationUpdate(locationUpdate({ latitude: 0.001, timestamp: 4000 })); // not later than 5000
+    expect(aggregate.getCurrentSession()?.route.length).toBe(1);
+  });
+
+  it('Pause → Resume within one session does NOT reset sequencing (only a new session does)', () => {
+    const { aggregate, engine } = setup();
+    engine.processCommand({ command: 'StartSession', timestamp: 1000, userPreferences: PREFS });
+    engine.processLocationUpdate(locationUpdate({ timestamp: 5000 }));
+    engine.processCommand({ command: 'PauseSession', timestamp: 6000 });
+    engine.processCommand({ command: 'ResumeSession', timestamp: 7000 });
+
+    engine.processLocationUpdate(locationUpdate({ latitude: 0.001, timestamp: 4000 })); // earlier than 5000
+
+    expect(aggregate.getCurrentSession()?.route.length).toBe(1);
   });
 });
